@@ -6,12 +6,14 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <thread>
 
+#include "internal.hpp"
 #include "net.hpp"
 
 namespace allsense {
@@ -53,11 +55,13 @@ std::string url_encode(const std::string& s) {
     return out;
 }
 
+// A '%' not followed by two hex digits stays as it is.
 std::string url_decode(const std::string& s) {
     std::string out;
     for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '%' && i + 2 < s.size()) {
-            out += static_cast<char>(std::stoi(s.substr(i + 1, 2), nullptr, 16));
+        if (s[i] == '%' && i + 2 < s.size() && std::isxdigit(static_cast<unsigned char>(s[i + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(s[i + 2]))) {
+            out += static_cast<char>(std::strtol(s.substr(i + 1, 2).c_str(), nullptr, 16));
             i += 2;
         } else {
             out += s[i] == '+' ? ' ' : s[i];
@@ -89,12 +93,35 @@ std::string fmt_double(double v) {
 
 }  // namespace
 
+namespace detail {
+
+json parse_message(const std::string& msg) {
+    json::parser_callback_t limit = [](int depth, json::parse_event_t, json&) {
+        if (depth > kMaxJsonDepth) throw std::runtime_error("JSON nested too deeply");
+        return true;
+    };
+    return json::parse(msg, limit);
+}
+
+bool safe_media_path(const std::string& url) {
+    return !url.empty() && url[0] == '/' && url.find_first_of("@\\\r\n") == std::string::npos;
+}
+
+}  // namespace detail
+
 // ---- Link ----
 
 Link parse_link(const std::string& link_in, const std::string& token) {
     std::string link = link_in;
     auto scheme = link.find("://");
-    if (scheme != std::string::npos) link = link.substr(scheme + 3);
+    if (scheme != std::string::npos) {
+        std::string name;
+        for (char c : link.substr(0, scheme)) name += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (name == "https" || name == "wss")
+            throw Error("The phone serves plain http:// and ws://; this client doesn't do TLS");
+        if (name != "http" && name != "ws") throw Error("Not a phone link: unknown scheme \"" + name + "\"");
+        link = link.substr(scheme + 3);
+    }
     std::string query;
     auto q = link.find('?');
     if (q != std::string::npos) {
@@ -323,7 +350,7 @@ struct PhoneImpl : std::enable_shared_from_this<PhoneImpl> {
                 if (r == WebSocket::Read::Timeout) continue;
                 last_rx = mono_ns();
                 try {
-                    handle(json::parse(msg));
+                    handle(detail::parse_message(msg));
                 } catch (const std::exception&) {
                     // a message we can't read: skip it
                 }
@@ -808,6 +835,7 @@ static std::string media_path(const Phone& phone, const std::string& name, const
     }
     std::string url = str(info.raw, "url");
     if (url.empty()) url = (kind == "image" ? "/camera/" : "/mic/") + info.name + (kind == "image" ? ".mjpg" : ".wav");
+    if (!detail::safe_media_path(url)) throw Error(info.name + " has no usable media url (the phone sent a bad one)");
     return url;
 }
 
@@ -840,6 +868,8 @@ std::string Phone::camera_url(const std::string& camera, const CameraOptions& o)
     std::string path = media_path(*this, camera, "image");
     if (o.codec == "h264") {
         std::string h264 = str(find(camera).raw, "h264_url");
+        if (!h264.empty() && !detail::safe_media_path(h264))
+            throw Error(camera + " has no usable h264 url (the phone sent a bad one)");
         if (!h264.empty()) path = h264;
         else replace_ext(path, ".mjpg", ".h264");
     } else if (o.codec != "mjpeg") {

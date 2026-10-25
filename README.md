@@ -144,9 +144,11 @@ pip install allsense-testkit   # or: pip install path/to/otterbridge-allsense-pr
 allsense-conformance --example build/print_values -- build/conformance
 ```
 
+`tests/unit.cpp` tests the limits on what a phone may send against a loopback server: `ctest --test-dir build`.
+
 ## Protocol
 
-The client speaks the AllSense protocol over WebSocket ([spec](https://docs.allsense.otterbridge.org/PROTOCOL/), [otterbridge-allsense-protocol](https://github.com/wen-da-ng/otterbridge-allsense-protocol)). Version 0 is experimental and may still change.
+The client speaks the AllSense protocol over WebSocket ([spec](https://docs.allsense.otterbridge.org/PROTOCOL/), [otterbridge-allsense-protocol](https://github.com/wen-da-ng/otterbridge-allsense-protocol)). Version 0 is experimental and may still change. Links are plain `http://` or `ws://` (the phone has no TLS; `https://`/`wss://` links are refused). The client refuses a message over 4 MiB or nested deeper than 64, and a snapshot over 32 MiB.
 
 ## License
 

@@ -85,6 +85,57 @@ std::string base64(const std::string& in) {
     return out;
 }
 
+// SHA-1 (FIPS 180-4), only for checking the handshake's Sec-WebSocket-Accept.
+std::string sha1(const std::string& in) {
+    std::uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+    std::string msg = in;
+    msg += static_cast<char>(0x80);
+    while (msg.size() % 64 != 56) msg += '\0';
+    std::uint64_t bits = static_cast<std::uint64_t>(in.size()) * 8;
+    for (int i = 7; i >= 0; --i) msg += static_cast<char>((bits >> (8 * i)) & 0xFF);
+    auto rol = [](std::uint32_t v, int n) { return (v << n) | (v >> (32 - n)); };
+    for (std::size_t chunk = 0; chunk < msg.size(); chunk += 64) {
+        std::uint32_t w[80];
+        for (int i = 0; i < 16; ++i) {
+            const auto* b = reinterpret_cast<const unsigned char*>(msg.data() + chunk + 4 * i);
+            w[i] = std::uint32_t{b[0]} << 24 | std::uint32_t{b[1]} << 16 | std::uint32_t{b[2]} << 8 | b[3];
+        }
+        for (int i = 16; i < 80; ++i) w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        std::uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; ++i) {
+            std::uint32_t f, k;
+            if (i < 20) {
+                f = (b & c) | (~b & d);
+                k = 0x5A827999;
+            } else if (i < 40) {
+                f = b ^ c ^ d;
+                k = 0x6ED9EBA1;
+            } else if (i < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8F1BBCDC;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xCA62C1D6;
+            }
+            std::uint32_t t = rol(a, 5) + f + e + k + w[i];
+            e = d;
+            d = c;
+            c = rol(b, 30);
+            b = a;
+            a = t;
+        }
+        h[0] += a;
+        h[1] += b;
+        h[2] += c;
+        h[3] += d;
+        h[4] += e;
+    }
+    std::string out;
+    for (auto v : h)
+        for (int i = 3; i >= 0; --i) out += static_cast<char>((v >> (8 * i)) & 0xFF);
+    return out;
+}
+
 std::string host_header(const std::string& host, int port) {
     bool v6 = host.find(':') != std::string::npos;
     return (v6 ? "[" + host + "]" : host) + ":" + std::to_string(port);
@@ -114,14 +165,30 @@ int status_of(const std::string& headers) {
     return sp == std::string::npos ? 0 : std::atoi(headers.c_str() + sp + 1);
 }
 
-long content_length(const std::string& headers) {
+// The value of header `name` (lower case, without the colon), trimmed; "" when it's missing.
+std::string header(const std::string& headers, const std::string& name) {
     std::string lower;
     for (char c : headers) lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    auto p = lower.find("\r\ncontent-length:");
-    return p == std::string::npos ? -1 : std::atol(lower.c_str() + p + 17);
+    auto p = lower.find("\r\n" + name + ":");
+    if (p == std::string::npos) return "";
+    p += name.size() + 3;
+    auto end = headers.find("\r\n", p);
+    std::string v = headers.substr(p, end == std::string::npos ? std::string::npos : end - p);
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(0, 1);
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+    return v;
+}
+
+long long content_length(const std::string& headers) {
+    std::string v = header(headers, "content-length");
+    return v.empty() ? -1 : std::atoll(v.c_str());
 }
 
 }  // namespace
+
+std::string websocket_accept(const std::string& key) {
+    return base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+}
 
 // ---- Socket ----
 
@@ -151,13 +218,19 @@ void Socket::connect(const std::string& host, int port, int timeout_ms) {
         rc = ::connect(s, a->ai_addr, static_cast<int>(a->ai_addrlen));
         bool ok = rc == 0;
         if (!ok) {
+#ifdef _WIN32
             fd_set wr, ex;
             FD_ZERO(&wr);
             FD_ZERO(&ex);
             FD_SET(s, &wr);
             FD_SET(s, &ex);
             timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-            if (select(static_cast<int>(s) + 1, nullptr, &wr, &ex, &tv) > 0) {
+            bool ready = select(static_cast<int>(s) + 1, nullptr, &wr, &ex, &tv) > 0;
+#else  // poll, not select: an fd past FD_SETSIZE would overflow an fd_set
+            pollfd pfd{s, POLLOUT, 0};
+            bool ready = poll(&pfd, 1, timeout_ms) > 0;
+#endif
+            if (ready) {
                 int so = 0;
                 socklen_t len = sizeof so;
                 getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so), &len);
@@ -242,8 +315,9 @@ void Socket::close() {
 void WebSocket::open(const std::string& host, int port, const std::string& path, int timeout_ms, int* http_status) {
     sock_.connect(host, port, timeout_ms);
     sock_.set_timeouts(timeout_ms, timeout_ms);
+    std::string key = base64(random_bytes(16));
     std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + host_header(host, port) +
-                      "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + base64(random_bytes(16)) +
+                      "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key +
                       "\r\nSec-WebSocket-Version: 13\r\n\r\n";
     sock_.send_all(req.data(), req.size());
     std::string headers = read_headers(sock_, buf_);
@@ -252,6 +326,8 @@ void WebSocket::open(const std::string& host, int port, const std::string& path,
         if (http_status) *http_status = status;
         throw std::runtime_error("the phone answered HTTP " + std::to_string(status));
     }
+    if (header(headers, "sec-websocket-accept") != websocket_accept(key))
+        throw std::runtime_error("not a WebSocket server (wrong Sec-WebSocket-Accept)");
     // Short read timeouts let the reader thread notice close() and stalls; sends stay patient.
     sock_.set_timeouts(500, 5000);
 }
@@ -312,7 +388,7 @@ WebSocket::Read WebSocket::read(std::string& out) {
                 for (int i = 0; i < 8; ++i) len = len << 8 | static_cast<unsigned char>(buf_[2 + i]);
                 head = 10;
             }
-            if (len > (64u << 20)) throw std::runtime_error("message too big");
+            if (len > kMaxMessage - partial_.size()) throw std::runtime_error("message too big");
             std::size_t mask_at = head;
             if (masked) head += 4;
             if (!fill(head + len)) return Read::Timeout;
@@ -359,7 +435,8 @@ WebSocket::Read WebSocket::read(std::string& out) {
 
 // ---- HTTP ----
 
-HttpResponse http_get(const std::string& host, int port, const std::string& path_and_query, int timeout_ms) {
+HttpResponse http_get(const std::string& host, int port, const std::string& path_and_query, int timeout_ms,
+                      std::size_t max_body) {
     Socket sock;
     sock.connect(host, port, timeout_ms);
     sock.set_timeouts(timeout_ms, timeout_ms);
@@ -369,15 +446,18 @@ HttpResponse http_get(const std::string& host, int port, const std::string& path
     HttpResponse r;
     std::string headers = read_headers(sock, r.body);
     r.status = status_of(headers);
-    long want = content_length(headers);
+    long long want = content_length(headers);
+    auto too_big = [&] { return std::runtime_error("answer bigger than " + std::to_string(max_body >> 20) + " MB"); };
+    if (want > static_cast<long long>(max_body)) throw too_big();
     char buf[16384];
-    while (want < 0 || static_cast<long>(r.body.size()) < want) {
+    while (want < 0 || static_cast<long long>(r.body.size()) < want) {
         long n = sock.recv_some(buf, sizeof buf);
         if (n == 0) break;
         if (n < 0) throw std::runtime_error("the phone stopped answering");
         r.body.append(buf, static_cast<std::size_t>(n));
+        if (want < 0 && r.body.size() > max_body) throw too_big();  // no Content-Length: read until close, bounded
     }
-    if (want >= 0 && static_cast<long>(r.body.size()) > want) r.body.resize(static_cast<std::size_t>(want));
+    if (want >= 0 && static_cast<long long>(r.body.size()) > want) r.body.resize(static_cast<std::size_t>(want));
     return r;
 }
 

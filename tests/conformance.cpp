@@ -78,6 +78,9 @@ void unit() {
         token_error = true;
     }
     CHECK(token_error);
+    CHECK(contains(throws([] { allsense::parse_link("https://192.168.1.20:8765/?token=a"); }), "TLS"));
+    CHECK(contains(throws([] { allsense::parse_link("wss://192.168.1.20:8765/ws?token=a"); }), "TLS"));
+    CHECK(allsense::parse_link("http://h/?token=a%zz%4").token == "a%zz%4");  // bad escapes stay as they are
 }
 
 void basics(const std::string& link) {
