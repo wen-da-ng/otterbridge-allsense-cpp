@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest   # GCC
+            bin: build
+          - os: macos-latest    # Clang
+            bin: build
+          - os: windows-latest  # MSVC
+            bin: build/Release
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The test kit (fake phone + scenarios) comes from otterbridge-allsense-protocol. Until allsense-testkit
+      # is on PyPI it's installed from that repo; while the repo is private, add a read-only TESTKIT_TOKEN secret.
+      - uses: actions/checkout@v4
+        with:
+          repository: wen-da-ng/otterbridge-allsense-protocol
+          token: ${{ secrets.TESTKIT_TOKEN || github.token }}
+          path: _testkit
+      - run: pip install ./_testkit
+      - name: Conformance
+        shell: bash
+        run: allsense-conformance --example ${{ matrix.bin }}/quickstart --example ${{ matrix.bin }}/print_values -- ${{ matrix.bin }}/conformance
+      - name: The docs' sample project builds against this repo
+        shell: bash
+        run: |
+          mkdir -p _project && cp examples/project/CMakeLists.txt examples/quickstart.cpp _project/
+          cmake -S _project -B _project/build -DFETCHCONTENT_SOURCE_DIR_ALLSENSE="$GITHUB_WORKSPACE" -DCMAKE_BUILD_TYPE=Release
+          cmake --build _project/build --config Release

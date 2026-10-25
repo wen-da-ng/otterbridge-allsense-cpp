@@ -1,0 +1,5 @@
+build*/
+_project/
+_testkit/
+allsense_log.csv
+CLAUDE.local.md
